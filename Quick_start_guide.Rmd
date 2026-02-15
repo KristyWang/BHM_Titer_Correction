@@ -1,0 +1,450 @@
+---
+title: "Quick Start Guide for a modelling framework to improve antibody titer estimation from dilution series data"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+## Introduction
+
+This quick-start guide provides basic instructions for using a Bayesian hierarchical modelling framework to estimate antibody titers while correcting for batch effects and other sources of experimental variation. 
+
+We use simulated dilution series data, mirroring the structure of data from respiratory syncytial virus (RSV) foci reduction neutralization tests (FRNTs), as an application example. Four levels of working virus dilution (an assay-level covariate) are simulated, with seven batches per level and 20 samples per batch, yielding a total of 28 batches and 560 serum samples. Each batch includes a virus control (VC), a positive control (PC), and an International Standard control (IS), which is assumed to be tested at two different concentrations (denoted as IS1 and IS2). The VC is assumed to be prepared at fixed dilutions with 22 replicates per batch. Each serum sample, along with the PC and IS, is assumed to be tested in duplicate across 3-fold serial dilutions ranging from 1:40 to 1:87480.
+
+In our modelling framework, first, foci reduction data is calculated using the assay readout (foci count) relative to the modelled mean foci counts in the VC for each working virus dilution. We then model the relationship between the dilution factor and reduction in foci counts using a hierarchical four-parameter logistic (4PL) model, allowing for random effects both between samples and between batches on each parameter. Each sample has its own set of parameter values drawn from a population-level distribution, whereas the PC and IS serve as references, with batch-specific parameters centered on their true values. Using this hierarchical approach, we fit a 4PL curve to the dilution series data from each sample, incorporating both sample-level and batch-level effects. Thus, the observed data are described by a 4PL curve that accounts for all of these sources of variation, whereas the true, unadjusted 4PL curve for each sample is obtained by removing the batch effects. The corrected antibody titer can then be calculated directly as a function of the unadjusted 4PL curve.
+
+## Outline
+
+The following steps are covered in this guide:  
+
+<p style="text-indent: 2em;">1. Getting started<br>
+2. Formating and inputting dilution series data<br>
+3. Estimating assay-level fixed effects<br>
+4. Generating foci reduction data<br>
+5. Removing 'Clear negative' samples<br>
+6. Running MCMC to generat batch-adjusted antibody titers<br>
+7. Processing outputs and generating plots<br>
+
+## 1. Getting started
+
+we first load the required R libraries and the Stan model code. We use two hierarchical models in this workflow:
+
+- **Model 1:** Estimates assay-level fixed effects, such as the effect of different virus working dilutions.
+- **Model 2:** Estimates antibody titers for each serum sample while correcting for batch effects.
+
+```{r, message=FALSE, warning=FALSE}
+# Clear workspace
+rm(list = ls())
+
+# Load required libraries
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(rstan)
+library(bayesplot)
+
+# Load Stan model code
+source("Stan_Model.R")
+
+# Set seed
+set.seed(12345)
+```
+
+## 2. Formating and inputting dilution series data
+
+The modelling framework expects dilution series data for all samples to be provided in long format, with the following columns:<br>
+<p style="text-indent: 2em;">1. sto_id: Index for each level of virus working dilution (or any other assay-level fixed effect that varies across batches).<br>
+2. bat_id: Index for each experimental batch.<br>
+3. sam_id: Index for each sample.<br>
+4. rep_id: Index for the replicate number for each sample.<br>
+5. dilution: Reciprocal of the dilution factor.<br>
+6. Count: Count of foci.<br>
+
+Similarly, experimental data for the PC, IS, and VC should also be provided in long format. The PC and IS datasets should include the columns sto_id, bat_id, rep_id, dilution, and Count, while the VC dataset should include sto_id, bat_id, and Count.
+
+```{r, fig.height=2, fig.width=10, message=FALSE}
+# Input experimental data from excel ----
+df_sam <- read_excel("simu_data.xlsx", sheet = "Sample")
+df_PC <- read_excel("simu_data.xlsx", sheet = "PC")
+df_IS1 <- read_excel("simu_data.xlsx", sheet = "IS500")
+df_IS2 <- read_excel("simu_data.xlsx", sheet = "IS1000")
+df_VC <- read_excel("simu_data.xlsx", sheet = "VC")
+
+# Check experimental data
+df_sam %>% filter(sam_id %in% 1:6) %>%
+  ggplot(aes(x = log(dilution), y = Count)) +
+  geom_point() +
+  geom_line(aes(group = rep_id)) +
+  facet_wrap(~ sam_id, nrow = 1)
+```
+
+## 3. Estimating assay-level fixed effects
+
+Assay-level fixed effects are estimated using Model 1. In this example, assay-level fixed effects represent the mean foci counts for each virus working dilution in the VC. This information will later be used to calculate foci reduction data.<br>
+
+The model expects input as a list with the following components:<br>
+<p style="text-indent: 2em;">1. num_sto_vc: Number of virus working dilution levels.<br>
+2. num_bat_vc: Number of experimental batches.<br>
+3. num_obs_vc: Total number of observations (including all VC replicates).<br>
+4. which_sto_vc: Index of the virus working dilution for each observation.<br>
+5. which_bat_vc: Index of the batch for each observation.<br>
+6. count_vc: Foci count for each observation.<br>
+7. which_sto_per_bat: Index mapping virus working dilution to each batch.<br>
+8. delta_prior: Prior distribution parameter for assay-level fixed effects.<br>
+9. sample_from_prior: Indicator for sampling from the prior only (0 = no, 1 = yes).<br>
+
+
+```{r, message=FALSE}
+# Mapping sto_id to batches
+which_sto_per_bat <- df_VC %>% group_by(bat_id) %>% slice(1)
+
+# Prepare data list for Stan model
+data1_stan <- list(num_sto_vc = 4,
+                   num_bat_vc = 28,
+                   num_obs_vc = nrow(df_VC),
+                   which_sto_vc = df_VC$sto_id,
+                   which_bat_vc = df_VC$bat_id,
+                   count_vc = df_VC$Count,
+                   
+                   which_sto_per_bat = which_sto_per_bat$sto_id,
+                   # Priors
+                   delta_prior = c(48, 44, 40, 25),
+                   sample_from_prior = 0)
+
+# Compile the Stan model
+model <- stan_model(model_code=model1_code)
+# Fit the model using MCMC
+# This step takes approximately 2 minutes. 
+# If no progress is observed, please try setting cores = 1.
+fit1 <- stan(model_code=model1_code, data=data1_stan,
+             chains=4, cores=4, iter=3000,
+             control = list(adapt_delta = 0.95))
+# Save the fitted model for future use
+saveRDS(fit1, file = "Simu_fit1.rds")
+# Extract posterior samples from the fitted model
+posterior1 <- extract(fit1)
+# Summarize assay-level effects (median across posterior samples)
+sto_param <- data.frame(
+  sto_id = 1:4,
+  post_sto_effect = apply(posterior1$delta, 2, median)
+)
+```
+
+## 4. Generating foci reduction data
+
+We account for assay-level fixed effects by calculating foci reduction, defined here as the proportion of foci reduction at each dilution relative to the mean foci count of VC for the same virus working dilution, as estimated by Model 1.<br>
+
+```{r, message=FALSE}
+df_PC <- left_join(df_PC, sto_param)
+df_PC$FR <- 1 - df_PC$Count/df_PC$post_sto_effect
+
+df_IS1 <- left_join(df_IS1, sto_param)
+df_IS1$FR <- 1 - df_IS1$Count/df_IS1$post_sto_effect
+
+df_IS2 <- left_join(df_IS2, sto_param)
+df_IS2$FR <- 1 - df_IS2$Count/df_IS2$post_sto_effect
+
+df_sam <- left_join(df_sam, sto_param)
+df_sam$FR <- 1 - df_sam$Count/df_sam$post_sto_effect
+```
+
+## 5. Removing 'Clear negative' samples
+"Clear negative" samples, defined as those exhibiting less than 30% foci reduction at the starting dilution (allowing a 20% margin to account for potential measurement error due to intra- or inter-batch variation), were excluded from curve fitting. This is reasonable because foci reduction decreases monotonically with dilution, indicating that the true response curves for such samples are highly unlikely to reach the 50% foci reduction threshold.
+
+```{r, message=FALSE}
+sample_fitting <- df_sam %>% filter(dilution == 40) %>% 
+  group_by(sam_id, bat_id) %>% 
+  summarise(max_y = mean(FR)) %>% 
+  filter(max_y > 0.3) %>% 
+  arrange(sam_id) 
+clear_neg <- df_sam %>% filter(!sam_id %in% sample_fitting$sam_id) 
+clear_neg <- unique(clear_neg$sam_id)
+
+# Assign new sample IDs after removing 'Clear negative' samples
+# New IDs should be continuous and start from 1
+sample_fitting$sam_id_new <- 1:nrow(sample_fitting)
+# Keep only samples retained for curve fitting
+df_sam <- df_sam %>% filter(sam_id %in% sample_fitting$sam_id)
+# Join new sample IDs back to the main dataset
+df_sam <- left_join(df_sam, sample_fitting[, c("sam_id", "sam_id_new")],
+                    by = join_by(sam_id))
+
+```
+
+## 6. Running MCMC to generat batch-adjusted antibody titers
+Sample-specific antibody titers are estimated using Model 2, with random batch effects being corrected. Depending on the experiment-specific assay design and sources of variability, this batch-effect correction framework can also be applied to adjust for other laboratory- or experiment-level random effects, such as heterogeneity arising from differences in assay protocols, equipment, reagents, or personnel, which are common in large-scale or multicenter studies.<br>
+
+The model expects input as a list with the following components:<br>
+<p style="text-indent: 2em;">1. num_bat_total: Total number of batches<br>
+2. Foci reduction data from assay controls.<br>
+   The same set of inputs is required for each serially diluted assay control; in this example, this includes PC, IS1, and IS2.<br> 
+   **Note**: If the experimental design does not include the International Standard, you need to remove all IS-related parts from the Stan model code before running the code.
+    - num_obs_pc: Total number of PC observations.<br>
+    - which_bat_pc:  Index of the batch corresponding to each PC observation.<br>
+    - x_log_pc: Log-transformed reciprocal dilution.<br>
+    - y_pc: Proportion of foci reduction.<br>
+3. Foci reduction data from serum samples<br>
+    - num_sam：Total number of serum samples.<br>
+    - num_obs：Total number of observations for all samples.<br>
+    - which_bat：Index of the batch corresponding to each observation.<br>
+    - which_sam：Index of the sample corresponding to each observation.<br>
+    - x_log：Log-transformed reciprocal dilution.<br>
+    - y：Proportion of foci reduction.<br>
+    - which_bat_per_sam: Index of the batch for each sample.<br>
+4. Priors<br>
+   - f_pc_prior：Prior 4PL parameters for PC.<br>
+   - f_IS1_prior：Prior 4PL parameters for IS1.<br>
+   - f_IS2_prior：Prior 4PL parameters for IS2.<br>
+   - f_pop_prior：Prior population-level 4PL parameters.<br>
+5. Lower and upper bounds for each 4PL parameters<br>
+   - f_lower: Lower bounds.<br>
+   - f_upper: Upper bounds.<br>
+6. sample_from_prior: Indicator for sampling from the prior only (0 = no, 1 = yes).<br>
+
+```{r, message=FALSE}
+# Prepare data list for Stan model
+data2_stan <- list(num_bat_total = 28,
+                   
+                   num_obs_pc = nrow(df_PC),
+                   which_bat_pc = df_PC$bat_id,
+                   x_log_pc = log(df_PC$dilution),
+                   y_pc = df_PC$FR,
+                   
+                   num_obs_IS1 = nrow(df_IS1),
+                   which_bat_IS1 = df_IS1$bat_id,
+                   x_log_IS1 = log(df_IS1$dilution),
+                   y_IS1 = df_IS1$FR,
+                   
+                   num_obs_IS2 = nrow(df_IS2),
+                   which_bat_IS2 = df_IS2$bat_id,
+                   x_log_IS2 = log(df_IS2$dilution),
+                   y_IS2 = df_IS2$FR,
+                   
+                   num_sam = length(unique(df_sam$sam_id_new)),
+                   num_obs = nrow(df_sam),
+                   which_bat = df_sam$bat_id,
+                   which_sam = df_sam$sam_id_new,
+                   x_log = log(df_sam$dilution),
+                   y = df_sam$FR,
+                   
+                   which_bat_per_sam = sample_fitting$bat_id,
+                   
+                   f_pc_prior = c(1, 0, 1, 6),
+                   f_IS1_prior = c(1, 0, 1, 6),   
+                   f_IS2_prior = c(1, 0, 1, 6),   
+                   f_pop_prior = c(1, 0, 1, 6),   
+                   
+                   f_lower = c(0, -1, 0, log(40)),
+                   f_upper = c(2,  1, 1, log(87480)),
+                   
+                   sample_from_prior = 0)
+
+# Compile the Stan model
+model <- stan_model(model_code=model2_code)
+# Fit the model using MCMC
+# This step takes approximately 15–30 minutes for this example.
+fit2 <- stan(model_code=model2_code, data=data2_stan,
+             chains=4, cores=4, iter=3000,
+             control = list(adapt_delta = 0.95))
+# Save the fitted model for future use
+saveRDS(fit2, file = "Simu_fit2.rds")
+# Extract posterior samples from the fitted model
+posterior2 <- extract(fit2)
+```
+
+## 7. Processing outputs and generating plots
+
+### 7.1 Model diagnosis
+
+After fitting the model, it is important to assess MCMC convergence (i.e., number of divergent transitions, Rhat values, and trace plots for model parameters) before proceeding with downstream titer estimates, thereby ensuring the reliability of the MCMC results.
+
+```{r, fig.height=1.5, fig.width=10, message=FALSE}
+# Number of divergence transitions 
+sampler_params <- get_sampler_params(fit2, inc_warmup = FALSE)
+divergent_per_chain <- sapply(sampler_params, function(x) sum(x[,"divergent__"]))
+divergent_per_chain
+
+# Rhat
+fit_summary <- summary(fit2)$summary
+summary(fit_summary[, "Rhat"])
+
+# Check population-level parameters 
+f_pop_samples <- rstan::extract(fit2, pars = c("f_pop[1]", "f_pop[2]", "f_pop[3]",  "f_pop[4]"), permuted = FALSE)
+mcmc_trace(f_pop_samples, facet_args = list(nrow = 1)) +
+  theme_bw() 
+# Check batch-level parameters 
+pars_to_check <- c("f_bat[1,1]", "f_bat[1,2]", "f_bat[1,3]", "f_bat[1,4]")
+f_bat_samples <- rstan::extract(fit2, pars = pars_to_check, permuted = FALSE)
+mcmc_trace(f_bat_samples, facet_args = list(nrow = 1)) +
+  theme_bw()
+# Check sample-level parameters
+pars_to_check <- c("f_sam_bat[1,1]", "f_sam_bat[1,2]", "f_sam_bat[1,3]", "f_sam_bat[1,4]")
+f_sam_samples <- rstan::extract(fit2, pars = pars_to_check, permuted = FALSE)
+mcmc_trace(f_sam_samples, facet_args = list(nrow = 1)) +
+  theme_bw()
+```
+
+### 7.2 4PL curve fits for PC and IS
+
+By comparing batch-specific fitted curves with the BHM-adjusted overall curves for PC and IS, batch-to-batch variability can be visually assessed.
+
+```{r, message=FALSE, fig.width=10, fig.height=2.5}
+
+# Batch-specific fitted curves
+df_PC$BHM_fit_FR <- apply(posterior2$mu_y_pc, 2, median)
+df_IS1$BHM_fit_FR <- apply(posterior2$mu_y_IS1, 2, median)
+df_IS2$BHM_fit_FR <- apply(posterior2$mu_y_IS2, 2, median)
+df_PC$control_sample <- "PC"
+df_IS1$control_sample <- "IS1"
+df_IS2$control_sample <- "IS2"
+df_control <- rbind(df_PC, df_IS1, df_IS2)
+df_control$curve_type <- "Batch-specific fitted curves"
+
+# BHM-adjusted overall curves
+Adj_PC_curve <- data.frame(control_sample = "PC",
+                           dilution =  unique(df_PC$dilution), 
+                           BHM_fit_FR = apply(posterior2$y_pc_adj, 2, median),
+                           BHM_fit_FR_lower = apply(posterior2$y_pc_adj, 2, quantile, 0.025),
+                           BHM_fit_FR_upper = apply(posterior2$y_pc_adj, 2, quantile, 0.975))
+Adj_IS1_curve <- data.frame(control_sample = "IS1",
+                            dilution =  unique(df_IS1$dilution), 
+                            BHM_fit_FR = apply(posterior2$y_IS1_adj, 2, median),
+                            BHM_fit_FR_lower = apply(posterior2$y_IS1_adj, 2, quantile, 0.025),
+                            BHM_fit_FR_upper = apply(posterior2$y_IS1_adj, 2, quantile, 0.975))
+Adj_IS2_curve <- data.frame(control_sample = "IS2",
+                            dilution =  unique(df_IS2$dilution), 
+                            BHM_fit_FR = apply(posterior2$y_IS2_adj, 2, median),
+                            BHM_fit_FR_lower = apply(posterior2$y_IS2_adj, 2, quantile, 0.025),
+                            BHM_fit_FR_upper = apply(posterior2$y_IS2_adj, 2, quantile, 0.975))
+df_control_adj <- rbind(Adj_PC_curve, Adj_IS1_curve, Adj_IS2_curve)
+df_control_adj$curve_type <- "BHM-adjusted overall curves"
+
+# Plot batch-specific fitted curves and BHM-adjusted overall curves
+ggplot() +
+  geom_line(data = df_control, 
+            aes(x = log(dilution), 
+                y = BHM_fit_FR, 
+                group = bat_id,
+                color = curve_type), alpha = 0.5) +
+  geom_line(data = df_control_adj, 
+            aes(x = log(dilution), 
+                y = BHM_fit_FR,
+                color = curve_type)) +
+  geom_ribbon(data = df_control_adj, 
+              aes(x = log(dilution),
+                  ymin = BHM_fit_FR_lower, 
+                  ymax = BHM_fit_FR_upper), 
+              fill = "#D7191C", alpha = 0.2) +
+  geom_hline(yintercept = 0.5, color = "grey", linetype = "dashed") +
+  facet_wrap(~factor(control_sample)) +
+  scale_color_manual("", 
+                     values = c("Batch-specific fitted curves" = "#FDAE61",
+                                "BHM-adjusted overall curves" = "#D7191C")) +
+  scale_x_continuous("Serial dilutions",
+                     breaks = log(unique(df_control_adj$dilution)), 
+                     labels = unique(df_control$dilution)) +
+  scale_y_continuous("Foci reduction (%)",
+                      limits = c(-0.5, 1), 
+                      breaks = seq(-0.5, 1, 0.25),
+                      labels = 100 * seq(-0.5, 1, 0.25)) +
+  theme_bw() 
+
+```
+
+### 7.3 4PL curve fits for a specific sample
+
+By comparing BHM-adjusted and unadjusted 4PL curves, the impact of batch effects on the titer estimate for each sample can be visually assessed.
+
+```{r, message=FALSE, fig.width=5, fig.height=2.5}
+sample_to_check <- 1
+# BHM-unadjusted curve
+df_sam$BHM_fit_FR <- apply(posterior2$mu_y, 2, median)
+df_sam$BHM_fit_FR_lower <- apply(posterior2$mu_y, 2, quantile, 0.025)
+df_sam$BHM_fit_FR_upper <- apply(posterior2$mu_y, 2, quantile, 0.975)
+# BHM-adjusted curve
+BHM_adj_FR <- apply(posterior2$y_sam_adj, c(2, 3), median)
+BHM_adj_FR_lower <- apply(posterior2$y_sam_adj, c(2, 3), quantile, 0.025)
+BHM_adj_FR_upper <- apply(posterior2$y_sam_adj, c(2, 3), quantile, 0.975)
+# Plot BHM-adjusted and BHM-unadjusted curves
+df_sam %>% filter(sam_id_new == sample_to_check) %>%
+  ggplot() +
+  geom_ribbon(aes(x = log(dilution),
+                  ymin = BHM_fit_FR_lower, 
+                  ymax = BHM_fit_FR_upper,
+                  fill = "BHM-unadjusted"), 
+               alpha = 0.2) +
+  geom_line(aes(x = log(dilution),
+                y = BHM_fit_FR,
+                group = sam_id_new,
+                color = "BHM-unadjusted")) +
+  geom_line(data = data.frame(dilution = unique(df_sam$dilution),
+                              BHM_adj_FR = BHM_adj_FR[, sample_to_check]),
+            aes(x = log(dilution),
+                y = BHM_adj_FR, 
+                color = "BHM-adjusted")) +
+  geom_ribbon(data = data.frame(dilution = unique(df_sam$dilution),
+                                BHM_adj_FR_lower = BHM_adj_FR_lower[, sample_to_check],
+                                BHM_adj_FR_upper = BHM_adj_FR_upper[, sample_to_check]),
+              aes(x = log(dilution),
+                  ymin = BHM_adj_FR_lower, 
+                  ymax = BHM_adj_FR_upper,
+                  fill = "BHM-adjusted"), 
+               alpha = 0.2) +
+  geom_hline(yintercept = 0.5, color = "grey", linetype = "dashed") +
+  scale_color_manual("", 
+                     values = c("BHM-unadjusted" = "#FDAE61",
+                                "BHM-adjusted" = "#D7191C")) +
+   scale_fill_manual("", 
+                     values = c("BHM-unadjusted" = "#FDAE61",
+                                "BHM-adjusted" = "#D7191C")) +
+  scale_x_continuous("Serial dilution",
+                     breaks = log(unique(df_control_adj$dilution)), 
+                     labels = unique(df_control$dilution)) +
+  scale_y_continuous("Foci reduction (%)",
+                      limits = c(-0.5, 1), 
+                      breaks = seq(-0.5, 1, 0.25),
+                      labels = 100 * seq(-0.5, 1, 0.25)) +
+  theme_bw() 
+  
+
+
+
+```
+
+### 7.4 Estimating BHM-adjusted antibody titers
+
+Finally, posterior medians and 95% credible intervals (CrIs) for antibody titers were calculated for each sample based on the MCMC results. For 'clear negative' samples, antibody titers were imputed at the assay’s lower limit of quantification (LLOQ).
+
+```{r, message=FALSE}
+# Summarize posterior samples: median and 95% CrI, log2-transformed
+posterior_summary <- apply(posterior2$Nt_sam_adj, 2, function(x) {
+  Median <- exp(median(x))
+  CrI_lower <- exp(quantile(x, 0.025))
+  CrI_upper <- exp(quantile(x, 0.975))
+  c(log2(Median), log2(CrI_lower), log2(CrI_upper))
+})
+
+summary_df <- as.data.frame(t(posterior_summary))
+colnames(summary_df) <- c("Estimate", "CrI_lower", "CrI_upper")
+summary_df$sam_id_new <- 1:nrow(summary_df)
+
+
+sample_fitting <- left_join(sample_fitting[, c("sam_id", "sam_id_new")], 
+                            summary_df, by = join_by(sam_id_new))
+
+# Include'clear negative' samples
+clear_neg_data <- data.frame(sam_id = clear_neg,
+                             sam_id_new = NA,
+                             Estimate = log2(40/3),
+                             CrI_lower = NA,
+                             CrI_upper = NA)
+# Combine results and sort by sample ID
+titer_estimate <- rbind(sample_fitting, clear_neg_data) %>%
+  arrange(sam_id)
+# Preview results
+titer_estimate[1:10,]
+```
+
+
+
