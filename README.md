@@ -44,7 +44,7 @@ This R script defines two custom functions for estimating 50% neutralizing antib
 • DRM_function – fits a four-parameter logistic (4PL) model to compute titers<br>
 Both functions accept a data frame containing dilution series data and calculate antibody titers based on user-specified column names.
 ### “2_Model_Stan.R”:
-This R script defines the Bayesian hierarchical modeling framework described in the manuscript, implemented via two Stan models:
+This R script defines the Bayesian hierarchical modeling framework described in the manuscript, implemented via two Stan models:<br>
 • Model 1 estimates the effect of each working virus stock using only virus control (VC) data. The objective is to isolate the contribution of different virus stocks to the observed foci counts in the VC (i.e., background signal), while accounting for batch-to-batch variability through a random effect.<br>
 • Model 2 estimates neutralizing antibody (nAb) titers for individual serum samples. It uses dilution series data from assay controls—including the internal positive control (PC) and the International Standard (IS)—to estimate and correct for batch effects. The model then analyzes dilution series from serum samples to generate accurate nAb titer estimates, appropriately adjusted for batch variability.<br>
 ### “3_Simu_Func.R”:
@@ -52,7 +52,7 @@ This R script defines a custom function to simulate dilution series data. The ge
 ### “4_Simulation_Study.R”:
 This R script contains the complete workflow for conducting the simulation study. It is organized into four main parts:<br>
 • Generates dilution series data that replicate key features of real RSV FRNT experimental data.<br>
-• Applies standard titer estimation methods, including the Karber formula and the 4PL model, to the simulated data.<br>
+• Applies standard titer estimation methods, including the Kärber formula and the 4PL model, to the simulated data.<br>
 • Fits Bayesian hierarchical modelling framework to the simulated data.<br>
 • Generates figures to visualize and interpret the simulation results, facilitating method comparison and performance assessment.<br>
 ### “5_Clean_experimental_data.R”:
@@ -60,8 +60,8 @@ This R script processes and integrates raw experimental data generated from RSV 
 ### “6_Measurement_uncertainty.R”:
 This R script analyzes variability in RSV FRNT measurements using experimental data from assay controls. The objectives are:<br>
 • To characterize measurement variability in both the raw experimental readouts (i.e., foci counts) and the derived foci reduction values.<br>
-• To quantify the contributions of within-batch and between-batch variability to titer estimates obtained using standard methods, including the Karber formula and the 4PL model.<br>
+• To quantify the contributions of within-batch and between-batch variability to titer estimates obtained using standard methods, including the Kärber formula and the 4PL model.<br>
 ### “7_Fit_experimental_data.R”:
-This script applies the proposed modeling framework to real RSV FRNT experimental data, alongside standard methods such as the Karber formula and the 4PL model. It also generates figures to summarize, visualize, and interpret the analysis results.<br>
+This script applies the proposed modeling framework to real RSV FRNT experimental data, alongside standard methods such as the Kärber formula and the 4PL model. It also generates figures to summarize, visualize, and interpret the analysis results.<br>
 ### “8_Serological_analysis.R”:
 This script evaluates how different titer estimation methods impact RSV serological measures at the population level. Analyses include age-stratified seroprevalence, geometric mean titers (GMTs), fold-rises, and seroconversion rates.<br>
